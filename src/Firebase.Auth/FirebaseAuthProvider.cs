@@ -1,17 +1,22 @@
 ﻿namespace Firebase.Auth
 {
     using System;
+    using System.Diagnostics;
+    using System.Linq;
     using System.Net.Http;
     using System.Text;
     using System.Threading.Tasks;
-
     using Newtonsoft.Json;
+    using Newtonsoft.Json.Linq;
 
     /// <summary>
     /// The auth token provider.
     /// </summary>
     public class FirebaseAuthProvider : IDisposable, IFirebaseAuthProvider
     {
+        private const string GoogleRefreshAuth = "https://securetoken.googleapis.com/v1/token?key={0}";
+        private const string GoogleCustomAuthUrl = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyCustomToken?key={0}";
+        private const string GoogleGetUser = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/getAccountInfo?key={0}";
         private const string GoogleIdentityUrl = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyAssertion?key={0}";
         private const string GoogleSignUpUrl = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/signupNewUser?key={0}";
         private const string GooglePasswordUrl = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key={0}";
@@ -31,7 +36,30 @@
             this.authConfig = authConfig;
             this.client = new HttpClient();
         }
-          
+
+        /// <summary>
+        /// Sign in with a custom token. You would usually create and sign such a token on your server to integrate with your existing authentiocation system.
+        /// </summary>
+        /// <param name="customToken"> The access token retrieved from login provider of your choice. </param>
+        /// <returns> The <see cref="FirebaseAuth"/>. </returns>
+        public async Task<FirebaseAuthLink> SignInWithCustomTokenAsync(string customToken)
+        {
+            string content = $"{{\"token\":\"{customToken}\",\"returnSecureToken\":true}}";
+            FirebaseAuthLink firebaseAuthLink = await this.ExecuteWithPostContentAsync(GoogleCustomAuthUrl, content).ConfigureAwait(false);
+            firebaseAuthLink.User = await this.GetUserAsync(firebaseAuthLink.FirebaseToken);
+            return firebaseAuthLink;
+        }
+
+        private async Task<User> GetUserAsync(string idToken)
+        {
+            var content = $"{{\"idToken\":\"{idToken}\"}}";
+            var response = await this.client.PostAsync(new Uri(string.Format(GoogleGetUser, this.authConfig.ApiKey)), new StringContent(content, Encoding.UTF8, "application/json"));
+
+            JObject resultJson = JObject.Parse(await response.Content.ReadAsStringAsync());
+            var user = JsonConvert.DeserializeObject<User>(resultJson["users"].First().ToString());
+            return user;
+        }
+
         /// <summary>
         /// Using the provided access token from third party auth provider (google, facebook...), get the firebase auth with token and basic user credentials.
         /// </summary>
@@ -92,7 +120,7 @@
 
                 signup.User.DisplayName = displayName;
             }
-            
+
             return signup;
         }
 
@@ -166,10 +194,37 @@
             }
         }
 
+        public async Task<FirebaseAuthLink> RefreshAuthAsync(FirebaseAuth auth)
+        {
+            var content = $"{{\"grant_type\":\"refresh_token\", \"refresh_token\":\"{auth.RefreshToken}\"}}";
+            var responseData = "N/A";
+
+            try
+            {
+                var response = await this.client.PostAsync(new Uri(string.Format(GoogleRefreshAuth, this.authConfig.ApiKey)), new StringContent(content, Encoding.UTF8, "application/json"));
+
+                responseData = await response.Content.ReadAsStringAsync();
+                var refreshAuth = JsonConvert.DeserializeObject<RefreshAuth>(responseData);
+
+                return new FirebaseAuthLink
+                {
+                    AuthProvider = this,
+                    User = auth.User,
+                    ExpiresIn = refreshAuth.ExpiresIn,
+                    RefreshToken = refreshAuth.RefreshToken,
+                    FirebaseToken = refreshAuth.AccessToken
+                };
+            }
+            catch (Exception ex)
+            {
+                throw new FirebaseAuthException(GoogleRefreshAuth, content, responseData, ex);
+            }
+        }
+
         /// <summary>
         /// Disposes all allocated resources. 
         /// </summary>
-        public void Dispose() 
+        public void Dispose()
         {
             this.client.Dispose();
         }
@@ -188,15 +243,120 @@
                 var user = JsonConvert.DeserializeObject<User>(responseData);
                 var auth = JsonConvert.DeserializeObject<FirebaseAuthLink>(responseData);
 
+                auth.AuthProvider = this;
                 auth.User = user;
 
                 return auth;
             }
             catch (Exception ex)
             {
-                throw new FirebaseAuthException(googleUrl, postContent, responseData, ex);
+                AuthErrorReason errorReason = GetFailureReason(responseData);
+                throw new FirebaseAuthException(googleUrl, postContent, responseData, ex, errorReason);
             }
         }
+
+        /// <summary>
+        /// Resolves failure reason flags based on the returned error code.
+        /// </summary>
+        /// <remarks>Currently only provides support for failed email auth flags.</remarks>
+        private static AuthErrorReason GetFailureReason(string responseData)
+        {
+            var failureReason = AuthErrorReason.Undefined;
+            try
+            {
+                if (!string.IsNullOrEmpty(responseData) && responseData != "N/A")
+                {
+                    //create error data template and try to parse JSON
+                    var errorData = new { error = new { code = 0, message = "errorid" } };
+                    errorData = JsonConvert.DeserializeAnonymousType(responseData, errorData);
+
+                    //errorData is just null if different JSON was received
+                    switch (errorData?.error?.message)
+                    {
+                        //general errors
+                        case "invalid access_token, error code 43.":
+                            failureReason = AuthErrorReason.InvalidAccessToken;
+                            break;
+
+                        case "CREDENTIAL_TOO_OLD_LOGIN_AGAIN":
+                            failureReason = AuthErrorReason.LoginCredentialsTooOld;
+                            break;
+
+                        //possible errors from Third Party Authentication using GoogleIdentityUrl
+                        case "INVALID_PROVIDER_ID : Provider Id is not supported.":
+                            failureReason = AuthErrorReason.InvalidProviderID;
+                            break;
+                        case "MISSING_REQUEST_URI":
+                            failureReason = AuthErrorReason.MissingRequestURI;
+                            break;
+                        case "A system error has occurred - missing or invalid postBody":
+                            failureReason = AuthErrorReason.SystemError;
+                            break;
+
+                        //possible errors from Email/Password Account Signup (via signupNewUser or setAccountInfo) or Signin
+                        case "INVALID_EMAIL":
+                            failureReason = AuthErrorReason.InvalidEmailAddress;
+                            break;
+                        case "MISSING_PASSWORD":
+                            failureReason = AuthErrorReason.MissingPassword;
+                            break;
+
+                        //possible errors from Email/Password Account Signup (via signupNewUser or setAccountInfo)
+                        case "WEAK_PASSWORD : Password should be at least 6 characters":
+                            failureReason = AuthErrorReason.WeakPassword;
+                            break;
+                        case "EMAIL_EXISTS":
+                            failureReason = AuthErrorReason.EmailExists;
+                            break;
+
+                        //possible errors from Email/Password Signin
+                        case "INVALID_PASSWORD":
+                            failureReason = AuthErrorReason.WrongPassword;
+                            break;
+                        case "EMAIL_NOT_FOUND":
+                            failureReason = AuthErrorReason.UnknownEmailAddress;
+                            break;
+                        case "USER_DISABLED":
+                            failureReason = AuthErrorReason.UserDisabled;
+                            break;
+
+                        //possible errors from Email/Password Signin or Password Recovery or Email/Password Sign up using setAccountInfo
+                        case "MISSING_EMAIL":
+                            failureReason = AuthErrorReason.MissingEmail;
+                            break;
+
+                        //possible errors from Password Recovery
+                        case "MISSING_REQ_TYPE":
+                            failureReason = AuthErrorReason.MissingRequestType;
+                            break;
+
+                        //possible errors from Account Linking
+                        case "INVALID_ID_TOKEN":
+                            failureReason = AuthErrorReason.InvalidIDToken;
+                            break;
+
+                        //possible errors from Getting Linked Accounts
+                        case "INVALID_IDENTIFIER":
+                            failureReason = AuthErrorReason.InvalidIdentifier;
+                            break;
+                        case "MISSING_IDENTIFIER":
+                            failureReason = AuthErrorReason.MissingIdentifier;
+                            break;
+                    }
+                }
+            }
+            catch (JsonReaderException)
+            {
+                //the response wasn't JSON - no data to be parsed
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"Unexpected error trying to parse the response: {e}");
+            }
+
+            return failureReason;
+        }
+
 
         private string GetProviderId(FirebaseAuthType authType)
         {
@@ -209,7 +369,8 @@
                     return authType.ToEnumString();
                 case FirebaseAuthType.EmailAndPassword:
                     throw new InvalidOperationException("Email auth type cannot be used like this. Use methods specific to email & password authentication.");
-                default: throw new NotImplementedException("");
+                default:
+                    throw new NotImplementedException("");
             }
         }
     }

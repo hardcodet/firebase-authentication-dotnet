@@ -54,6 +54,62 @@
         }
 
         [TestMethod]
+        public void Unknown_email_address_should_be_reflected_by_failure_reason()
+        {
+            using (var authProvider = new FirebaseAuthProvider(new FirebaseConfig(ApiKey)))
+            {
+                try
+                {
+                    authProvider.SignInWithEmailAndPasswordAsync("someinvalidaddressxxx@foo.com", FirebasePassword).Wait();
+                    Assert.Fail("Sign-in should fail with invalid email.");
+                }
+                catch (Exception e)
+                {
+                    var exception = (FirebaseAuthException) e.InnerException;
+                    exception.Reason.Should().Be(AuthErrorReason.UnknownEmailAddress);
+                }
+            }
+        }
+
+        [TestMethod]
+        public void Invalid_email_address_format_should_be_reflected_by_failure_reason()
+        {
+            using (var authProvider = new FirebaseAuthProvider(new FirebaseConfig(ApiKey)))
+            {
+                try
+                {
+                    authProvider.SignInWithEmailAndPasswordAsync("notanemailaddress", FirebasePassword).Wait();
+                    Assert.Fail("Sign-in should fail with invalid email.");
+                }
+                catch (Exception e)
+                {
+                    var exception = (FirebaseAuthException)e.InnerException;
+                    exception.Reason.Should().Be(AuthErrorReason.InvalidEmailAddress);
+                }
+            }
+        }
+
+
+
+        [TestMethod]
+        public void Invalid_password_should_be_reflected_by_failure_reason()
+        {
+            using (var authProvider = new FirebaseAuthProvider(new FirebaseConfig(ApiKey)))
+            {
+                try
+                {
+                    authProvider.SignInWithEmailAndPasswordAsync(FirebaseEmail, "xx" + FirebasePassword).Wait();
+                    Assert.Fail("Sign-in should fail with invalid password.");
+                }
+                catch (Exception e)
+                {
+                    var exception = (FirebaseAuthException)e.InnerException;
+                    exception.Reason.Should().Be(AuthErrorReason.WrongPassword);
+                }
+            }
+        }
+
+        [TestMethod]
         public void CreateUserTest()
         {
             var authProvider = new FirebaseAuthProvider(new FirebaseConfig(ApiKey));
@@ -103,6 +159,22 @@
 
             linkedAccounts.IsRegistered.Should().BeTrue();
             linkedAccounts.Providers.Single().ShouldBeEquivalentTo(FirebaseAuthType.EmailAndPassword);
+        }
+
+        [TestMethod]
+        public void RefreshAccessToken()
+        {
+            var authProvider = new FirebaseAuthProvider(new FirebaseConfig(ApiKey));
+
+            var auth = authProvider.SignInWithOAuthAsync(FirebaseAuthType.Facebook, FacebookAccessToken).Result;
+            var originalToken = auth.FirebaseToken;
+            
+            // simulate the token already expired
+            auth.Created = DateTime.MinValue;
+            
+            var freshAuth = auth.GetFreshAuthAsync().Result;
+
+            freshAuth.FirebaseToken.Should().NotBe(originalToken);
         }
     }
 }
